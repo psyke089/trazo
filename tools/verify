@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Local and CI verification gate for Trazo.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+# `android build --` resolves forwarded tasks against the root project, where the module tasks
+# don't exist; the wrapper is the working equivalent and needs no Android CLI on CI.
+exec ./gradlew --no-daemon testDebugUnitTest lintDebug assembleDebug "$@"

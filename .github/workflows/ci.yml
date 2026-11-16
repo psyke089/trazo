@@ -1,0 +1,142 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish a GitHub release for the current version'
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  # 4-core runner with 16 GB of RAM; the Android plugin does not need more.
+  GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx3g -Dorg.gradle.parallel=true
+
+jobs:
+  test:
+    # Every push to main: the same local gate, no release assets.
+    if: github.ref_type == 'branch' && github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Install Android SDK packages
+        run: tools/install-android-sdk.sh
+      - run: ./tools/verify
+
+  apk:
+    # Tags publish a GitHub release; a manual dispatch builds the same APK without publishing.
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Install Android SDK packages
+        run: tools/install-android-sdk.sh
+      - name: Restore the release signing key
+        # Every published APK must keep the signing identity of the earlier releases, otherwise an
+        # update fails with INSTALL_FAILED_UPDATE_INCOMPATIBLE.
+        env:
+          KEYSTORE_B64: ${{ secrets.TRAZO_KEYSTORE_B64 }}
+          STORE_PASSWORD: ${{ secrets.TRAZO_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.TRAZO_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.TRAZO_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for secret in KEYSTORE_B64 STORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!secret}" ]; then
+              echo "::error::missing signing secret $secret"
+              exit 1
+            fi
+          done
+          keystore="$RUNNER_TEMP/trazo-release.jks"
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$keystore"
+          {
+            printf 'TRAZO_STORE_FILE=%s\n' "$keystore"
+            printf 'TRAZO_STORE_PASSWORD=%s\n' "$STORE_PASSWORD"
+            printf 'TRAZO_KEY_ALIAS=%s\n' "$KEY_ALIAS"
+            printf 'TRAZO_KEY_PASSWORD=%s\n' "$KEY_PASSWORD"
+          } >> "$GITHUB_ENV"
+      - name: Build release APK
+        run: ./gradlew --no-daemon assembleRelease
+      - name: Resolve the APK and its reported version
+        id: apk
+        run: |
+          set -euo pipefail
+          aapt2=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 | sort -V | tail -1)
+          apk=$(find app/build/outputs/apk/release -name '*.apk' ! -name '*unsigned*' | head -1)
+          [ -n "$apk" ] || { echo "::error::no signed release APK produced"; exit 1; }
+          name=$("$aapt2" dump badging "$apk" | sed -n "s/^package:.*versionName='\([^']*\)'.*/\1/p")
+          [ -n "$name" ] || { echo "::error::cannot read versionName from $apk"; exit 1; }
+          echo "path=$apk" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "tag=v$name" >> "$GITHUB_OUTPUT"
+      - name: Tag must match the APK version
+        if: github.ref_type == 'tag'
+        run: |
+          test "${{ steps.apk.outputs.tag }}" = "$GITHUB_REF_NAME" ||
+            { echo "::error::tag $GITHUB_REF_NAME does not match versionName ${{ steps.apk.outputs.name }}"; exit 1; }
+      - name: Assert the release signature
+        env:
+          CERT_SHA256: ${{ secrets.TRAZO_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          apksigner=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          certs="$RUNNER_TEMP/certs.txt"
+          "$apksigner" verify --print-certs "${{ steps.apk.outputs.path }}" | tee "$certs"
+          if [ -n "$CERT_SHA256" ]; then
+            grep -qi "certificate SHA-256 digest: $CERT_SHA256" "$certs" ||
+              { echo "::error::APK is not signed with the expected Trazo release key"; exit 1; }
+          fi
+      - name: Package release asset and notes
+        run: |
+          set -euo pipefail
+          name=${{ steps.apk.outputs.name }}
+          tag=${{ steps.apk.outputs.tag }}
+          mkdir -p dist
+          cp "${{ steps.apk.outputs.path }}" "dist/trazo-$name.apk"
+          (cd dist && sha256sum "trazo-$name.apk" > "trazo-$name.apk.sha256")
+          digest=$(cut -d' ' -f1 "dist/trazo-$name.apk.sha256")
+          {
+            printf 'A private, offline Android app in Kotlin and Jetpack Compose.\n\n'
+            printf '## Download\n\n'
+            printf '[`trazo-%s.apk`](https://github.com/%s/releases/download/%s/trazo-%s.apk) — signed release build, upgrades in place. SHA-256: `%s`\n' "$name" "$GITHUB_REPOSITORY" "$tag" "$name" "$digest"
+            printf '\nAndroid 7.0+; no network access, accounts, analytics or ads.\n'
+          } > dist/notes.md
+          cat dist/notes.md
+      - name: Upload preview artifact
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: trazo-preview-apk
+          path: dist/*
+          retention-days: 14
+      - name: Publish release
+        if: github.ref_type == 'tag' || inputs.publish == true
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Trazo ${{ steps.apk.outputs.name }}
+          tag_name: ${{ steps.apk.outputs.tag }}
+          body_path: dist/notes.md
+          prerelease: ${{ contains(steps.apk.outputs.tag, '-') }}
+          files: |
+            dist/*.apk
+            dist/*.sha256
