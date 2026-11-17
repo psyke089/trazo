@@ -4,7 +4,7 @@ Guidance for coding agents working in this repository.
 
 ## Project
 
-Trazo is a private, fully offline Android app built with Kotlin and Jetpack Compose. Package
+Trazo is a fully offline Android app built with Kotlin and Jetpack Compose. Package
 `app.trazo`; minimum Android 7.0 (API 24). It starts from the Android CLI `empty-activity`
 scaffold and has no product behaviour beyond that baseline yet.
 
@@ -54,6 +54,14 @@ Run the focused test (or `tools/verify` for shared infrastructure) while iterati
   with `trazo.storeFile`/`storePassword`/`keyAlias`/`keyPassword` in `~/.gradle/gradle.properties`
   (CI: the `TRAZO_*` secrets). Never commit keys or passwords. Losing the key means published
   installs can never be upgraded in place.
+
+## Remotes
+
+- `origin` is Codeberg (`k4r/trazo`, private) and canonical: commit and push there.
+- `github` (`psyke089/trazo`) is the public mirror and the release host. `./tools/sync` pushes
+  `main` and the release tag at HEAD to both, in their own pushes so the `v*` release run fires.
+- Never commit to `github` and never force it. GitHub PRs are read-only; pull patches locally and
+  push through `origin`.
 
 ## Conventions
 
